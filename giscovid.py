@@ -4,7 +4,7 @@ import requests
 import struct
 import re
 
-def unpack(buf, size, el_type):
+def _unpack(buf, size, el_type):
     """
     Unpack an array using struct's iter_unpack.
 
@@ -29,23 +29,7 @@ def unpack(buf, size, el_type):
     unpacked = [ v[0] for v in struct.iter_unpack(fmt, buf[:size*tp_size]) ]
     return unpacked, size*tp_size
 
-def load_comuni():
-    """
-    Load a dictionary of id:name values, where `id` 
-    is a unique identifier for each municipality in Italy
-    (as defined by ISTAT), `name` is the municipality's name
-
-    Arguments:
-    none
-
-    Returns:
-    comuni: a dictionary -- as described above
-    """
-    dtypes = {"codice_comune": str, "denominazione": str}
-    df = pd.read_csv("comuni_piemonte.csv", delimiter=";", dtype=dtypes)
-    return df.set_index("codice_comune")
-
-def comune_id(i):
+def _comune_id(i):
     """
     Convert `i` into a 6-digits, 0-padded string,
     compliant with ISTAT codes
@@ -56,7 +40,7 @@ def _get_cols(cols_string):
     _, _, *cols = cols_string.split(";")
     return cols
 
-def get_header(base_url):
+def _get_header(base_url):
     """
     Retrieve the header string (containing the number
     of municipalities and the name of the columns
@@ -73,15 +57,15 @@ def get_header(base_url):
 
     return _get_cols(r.content.decode())
 
-def load_header(fname):
+def _load_header(fname):
     with open(fname) as f:
         return _get_cols(f.read())
 
-def load_data(fname):
+def _load_data(fname):
     with open(fname, "rb") as f:
         return f.read()
     
-def get_data(base_url):
+def _get_data(base_url):
     """
     Retrieve the data regarding the cases for each
     municipality (both in absolute terms, and for
@@ -98,7 +82,7 @@ def get_data(base_url):
         raise Exception("Cannot retrieve data")
     return r.content
 
-def get_datetime(base_url):
+def _get_datetime(base_url):
     url = f"{base_url}/config.json"
     """
     Retrieve the datetime object from a config.json
@@ -131,44 +115,48 @@ def get_datetime(base_url):
 
 
 
-def parse_data(buf, cols, dt, comuni):
+def _parse_data(buf, cols, dt, comuni):
     """
     Parse the data obtained from the various get_*
     functions to produce a DataFrame with the information
     about cases
 
     Arguments:
-    buf:  a blob returned by get_data() (contains info about
-           municipality ids and cases
-    cols: the number of columns contained in `buf` (should
-          have length 2 and we are not going to use it --
-          but still passing it for possible future needs)
-    dt:  a datetime object with the date/time info of the 
-         latest update
+    buf:    a blob returned by get_data() (contains info about
+            municipality ids and cases
+    cols:   the number of columns contained in `buf` (should
+            have length 2 and we are not going to use it --
+            but still passing it for possible future needs)
+    dt:     a datetime object with the date/time info of the 
+            latest update
     comuni: a DataFrame with the mapping comune_id -> name
+
+    Returns:
+    df: a pandas DataFrame with columns (datetime, denominazione, 
+        positivi, positivi_1000) and index comune_id
 
     """
 
     num_comuni = len(comuni)
     # the first 4 * 1181 bytes contain the municipalities'
     # codes (stored in `comuni_id_list`)
-    comuni_id_list, offset = unpack(buf, num_comuni, "int32")
+    comuni_id_list, offset = _unpack(buf, num_comuni, "int32")
 
     # the following 4 * 1181 * 2 bytes contain the tuple
     # (#cases, #cases/1000 ppl) for each municipality (stored in `values`)
-    values, _ = unpack(buf[offset:], num_comuni * len(cols), "float32") # 
+    values, _ = _unpack(buf[offset:], num_comuni * len(cols), "float32") # 
 
     # making some assumptions on the columns (expecting 2)
     if len(cols) != 2:
         raise Exception(f"Expecting 2 columns, found {len(cols)}")
 
-    cid_index = [ comune_id(cid) for cid in comuni_id_list ]
+    cid_index = [ _comune_id(cid) for cid in comuni_id_list ]
     cols = ["denominazione", "datetime", "positivi", "positivi_1000"]
     df = pd.DataFrame(columns=cols, index=cid_index)
 
     entries = []
     for i in range(num_comuni):
-        cid = comune_id(comuni_id_list[i])
+        cid = _comune_id(comuni_id_list[i])
         df.loc[cid, "positivi"] = int(values[i*2])
         df.loc[cid, "positivi_1000"] = round(values[i*2+1], 4) # 4 should suffice
 
@@ -179,26 +167,71 @@ def parse_data(buf, cols, dt, comuni):
 
 giscovid_url = "https://giscovid.sdp.csi.it/tiles/data"
 
+def load_comuni():
+    """
+    Load a dictionary of id:name values, where `id` 
+    is a unique identifier for each municipality in Italy
+    (as defined by ISTAT), `name` is the municipality's name
+
+    Arguments:
+    none
+
+    Returns:
+    comuni: a dictionary -- as described above
+    """
+    dtypes = {"codice_comune": str, "denominazione": str}
+    df = pd.read_csv("comuni_piemonte.csv", delimiter=";", dtype=dtypes)
+    return df.set_index("codice_comune")
+
+
 def fetch_current_datetime():
-    dt = get_datetime(giscovid_url)
+    """
+    Return a datetime object of the latest available update
+    (wrapper for _get_datetime without needing to know the
+    target url).
+    
+    When slow polling, it is recommended to use fetch_current_datetime()
+    before fetch_current_data() to make sure that the available
+    data would be new (fetch_current_datetime() makes only one, 
+    lightweight GET request).
+
+    Returns:
+    dt: a datetime of the latest update
+    """
+    dt = _get_datetime(giscovid_url)
     return dt
 
 def fetch_current_data():
-    dt = get_datetime(giscovid_url)
-    cols = get_header(giscovid_url)
-    data = get_data(giscovid_url)
+    """
+    Collect various types of data (latest datetime, list of
+    municipalities, list of activate cases) and return a 
+    DataFrame with the latest data available
+
+    Returns: a pandas DataFrame, as returned by parse_data()
+    """
+    dt = _get_datetime(giscovid_url)
+    cols = _get_header(giscovid_url)
+    data = _get_data(giscovid_url)
 
     comuni = load_comuni()
 
-    return parse_data(data, cols, dt, comuni)
+    return _parse_data(data, cols, dt, comuni)
 
 def fetch_data_from_files(in_file, va_file, dt):
-    cols = load_header(va_file)
-    data = load_data(in_file)
+    """
+    Given a path for the in.dat and va.dat files (i.e. the files
+    typically downloaded from `giscovid_url`), compute the pandas
+    DataFrame with the relevant data (no data is downloaded in this
+    function -- useful for previously downloaded data)
+
+    Returns: a pandas DataFrame, as returned by parse_data()
+    """
+    cols = _load_header(va_file)
+    data = _load_data(in_file)
 
     comuni = load_comuni()
 
-    return parse_data(data, cols, dt, comuni)
+    return _parse_data(data, cols, dt, comuni)
 
 if __name__ == "__main__":
     df = fetch_current_data()
